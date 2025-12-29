@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=comm_bench
-#SBATCH --partition=ai
-#SBATCH --gres=gpu:8
+# #SBATCH --partition=ai
+#SBATCH --gres=gpu:2
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=40
-#SBATCH --time=01:00:00
+#SBATCH --cpus-per-task=10
+#SBATCH --time=00:10:00
 #SBATCH --output=comm_bench_%j.out
 #SBATCH --error=comm_bench_%j.err
 
@@ -32,6 +32,7 @@ module load gnu12/12.5.0
 module load cmake/3.29.2
 module load cuda/12.9.1
 module load nccl/2.28.9-cuda12.9
+module load git/2.9.5
 
 # Verify environment
 echo "=== Environment ==="
@@ -45,31 +46,29 @@ echo "=== GPU Availability ==="
 nvidia-smi -L
 echo ""
 
-echo "=== GPU Topology ==="
-nvidia-smi topo -m
-echo ""
-
 # Navigate to project
 cd /scratch/hkanpak21/fides_matmul_step1/FIDESlib
 
-# Build comm tests if not already built
-if [ ! -d "build/comm" ]; then
-    echo "=== Building Communication Tests ==="
-    cd build
+# Build comm tests if not already built (just in case)
+if [ ! -d "build/comm" ] || [ ! -f "build/comm/nccl_allreduce" ]; then
+    echo "=== Building Communication Tests (On-demand) ==="
+    mkdir -p build && cd build
     cmake .. -DCMAKE_BUILD_TYPE=Release \
              -DCMAKE_CXX_COMPILER=$(which g++) \
-             -DCMAKE_CUDA_COMPILER=$(which nvcc)
+             -DCMAKE_CUDA_COMPILER=$(which nvcc) \
+             -DOpenFHE_DIR=/scratch/hkanpak21/fides_matmul_step1/local/lib/OpenFHE \
+             -DBUILD_COMM_TESTS=ON
     make -j8 nccl_allreduce p2p_bw
     cd ..
 fi
 
-# Run NCCL All-Reduce Test
+# Run NCCL All-Reduce Test (Smoke Test on 2 GPUs)
 echo ""
 echo "=========================================="
-echo " NCCL All-Reduce Test"
+echo " NCCL All-Reduce Test (2 GPUs)"
 echo "=========================================="
 if [ -f "build/comm/nccl_allreduce" ]; then
-    ./build/comm/nccl_allreduce 8
+    ./build/comm/nccl_allreduce 2
 else
     echo "ERROR: nccl_allreduce binary not found"
 fi

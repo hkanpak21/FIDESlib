@@ -302,6 +302,7 @@ target_compile_options(fideslib-bench PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:RELWITHDEBINFO>>:-lineinfo>
 )
 
+
 ############### Multi-GPU Communication Tests ###################
 
 option(BUILD_COMM_TESTS "Build NCCL and P2P multi-GPU communication tests" OFF)
@@ -310,4 +311,9 @@ if(BUILD_COMM_TESTS)
     message(STATUS "Building multi-GPU communication tests")
     add_subdirectory(comm)
 endif()
+
+############### New Phase Benchmarks ###################
+# Added as examples to avoid conflict with main bench runner
+add_subdirectory(examples/bootstrap_batch_mgpu)
+add_subdirectory(examples/lintrans_diag)
 
