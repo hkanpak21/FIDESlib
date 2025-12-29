@@ -43,7 +43,7 @@ set(CMAKE_CXX_EXTENSIONS ON)
 include(CheckLanguage)
 check_language(CUDA)
 
-set(CMAKE_CUDA_ARCHITECTURES "80-real;86-real;89-real")
+set(CMAKE_CUDA_ARCHITECTURES "70-real;75-real;80-real;86-real;89-real")
 
 if (NOT DEFINED CUDA_TOOLKIT_ROOT_DIR)
     set(CUDA_TOOLKIT_ROOT_DIR /usr/local/cuda)
@@ -301,4 +301,13 @@ target_compile_options(fideslib-bench PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:DEBUG>>:-G>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:RELWITHDEBINFO>>:-lineinfo>
 )
+
+############### Multi-GPU Communication Tests ###################
+
+option(BUILD_COMM_TESTS "Build NCCL and P2P multi-GPU communication tests" OFF)
+
+if(BUILD_COMM_TESTS)
+    message(STATUS "Building multi-GPU communication tests")
+    add_subdirectory(comm)
+endif()
 
