@@ -11,7 +11,15 @@
 
 #include "CKKS/Parameters.cuh"
 
+#include <set>
+#include "CKKS/Parameters.cuh"
+
 namespace FIDESlib {
+
+static std::set<int> initialized_gpus;
+static int initialized_N = 0;
+static int initialized_L = 0;
+static int initialized_K = 0;
 
 __constant__ Constants constants;
 namespace Globals {
@@ -147,7 +155,37 @@ void SetupConstants(const std::vector<PrimeRecord>& q, const std::vector<std::ve
                     const Scheme& parameters) {
     CudaCheckErrorMod;
 
-    cleanUpPrevious();
+    // Check if we need to re-initialize or can reuse existing setup
+    bool compatible = (initialized_N == N && initialized_L == (int)q.size() && initialized_K == (int)p.size());
+
+    // Find which GPUs need initialization
+    std::vector<int> gpus_to_init;
+    for (int id : GPUid) {
+        if (initialized_gpus.find(id) == initialized_gpus.end()) {
+            gpus_to_init.push_back(id);
+        }
+    }
+
+    // If compatible and all GPUs already initialized, we can skip mostly
+    if (compatible && gpus_to_init.empty()) {
+        for (int id : GPUid) {
+            cudaSetDevice(id);
+            cudaMemcpyToSymbol(constants, &host_constants, sizeof(Constants), 0, cudaMemcpyHostToDevice);
+        }
+        return;
+    }
+
+    // If not compatible, clean up and start fresh
+    if (!compatible && !initialized_gpus.empty()) {
+        cleanUpPrevious();
+        initialized_gpus.clear();
+        gpus_to_init = std::vector<int>(GPUid.begin(), GPUid.end());
+    }
+
+    // Track what we're initializing
+    initialized_N = N;
+    initialized_L = q.size();
+    initialized_K = p.size();
 
     for (int id : GPUid) {
         cudaSetDevice(id);
@@ -347,53 +385,57 @@ void SetupConstants(const std::vector<PrimeRecord>& q, const std::vector<std::ve
         }
     }
 
-    for (size_t i = 0; i < GPUid.size(); ++i) {
-        cudaSetDevice(0/*GPUid.at(i)*/);
-CudaCheckErrorMod;
+    for (int gpu_id : gpus_to_init) {
+        cudaSetDevice(gpu_id);
+        CudaCheckErrorMod;
         for (int j = 0; j < hC_.L + hC_.K; ++j) {
             int bytes = hC_.N * ((HISU64(j)) ? sizeof(uint64_t) : sizeof(uint32_t));
 
-            cudaMalloc(&(hG_.psi_ptr[i][j]), bytes);
-            cudaMalloc(&(hG_.inv_psi_ptr[i][j]), bytes);
-            cudaMalloc(&(hG_.psi_no_ptr[i][j]), 2 * bytes);
-            cudaMalloc(&(hG_.inv_psi_no_ptr[i][j]), 2 * bytes);
-            cudaMalloc(&(hG_.psi_middle_scale_ptr[i][j]), bytes);
-            cudaMalloc(&(hG_.inv_psi_middle_scale_ptr[i][j]), bytes);
-            cudaMalloc(&(hG_.psi_barrett_ptr[i][j]), bytes);
-            cudaMalloc(&(hG_.inv_psi_barrett_ptr[i][j]), bytes);
+            cudaMalloc(&(hG_.psi_ptr[gpu_id][j]), bytes);
+            cudaMalloc(&(hG_.inv_psi_ptr[gpu_id][j]), bytes);
+            cudaMalloc(&(hG_.psi_no_ptr[gpu_id][j]), 2 * bytes);
+            cudaMalloc(&(hG_.inv_psi_no_ptr[gpu_id][j]), 2 * bytes);
+            cudaMalloc(&(hG_.psi_middle_scale_ptr[gpu_id][j]), bytes);
+            cudaMalloc(&(hG_.inv_psi_middle_scale_ptr[gpu_id][j]), bytes);
+            cudaMalloc(&(hG_.psi_barrett_ptr[gpu_id][j]), bytes);
+            cudaMalloc(&(hG_.inv_psi_barrett_ptr[gpu_id][j]), bytes);
             CudaCheckErrorMod;
-            cudaMemcpy(hG_.psi_ptr[i][j], hG_.psi[j], bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(hG_.inv_psi_ptr[i][j], hG_.inv_psi[j], bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(hG_.psi_no_ptr[i][j], hG_.psi_no[j], 2 * bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(hG_.inv_psi_no_ptr[i][j], hG_.inv_psi_no[j], 2 * bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(hG_.psi_middle_scale_ptr[i][j], hG_.psi_middle_scale[j], bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(hG_.inv_psi_middle_scale_ptr[i][j], hG_.inv_psi_middle_scale[j], bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(hG_.psi_barrett_ptr[i][j], hG_.psi_shoup[j], bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(hG_.inv_psi_barrett_ptr[i][j], hG_.inv_psi_shoup[j], bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.psi_ptr[gpu_id][j], hG_.psi[j], bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.inv_psi_ptr[gpu_id][j], hG_.inv_psi[j], bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.psi_no_ptr[gpu_id][j], hG_.psi_no[j], 2 * bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.inv_psi_no_ptr[gpu_id][j], hG_.inv_psi_no[j], 2 * bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.psi_middle_scale_ptr[gpu_id][j], hG_.psi_middle_scale[j], bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.inv_psi_middle_scale_ptr[gpu_id][j], hG_.inv_psi_middle_scale[j], bytes,
+                       cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.psi_barrett_ptr[gpu_id][j], hG_.psi_shoup[j], bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.inv_psi_barrett_ptr[gpu_id][j], hG_.inv_psi_shoup[j], bytes, cudaMemcpyHostToDevice);
             CudaCheckErrorMod;
         }
 
-        cudaMemcpyToSymbol(Globals::psi, hG_.psi_ptr[i], sizeof(Globals::psi), 0, cudaMemcpyHostToDevice);
-CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::psi_no, hG_.psi_no_ptr[i], sizeof(hG_.psi_no_ptr[i]), 0, cudaMemcpyHostToDevice);
-CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::psi_middle_scale, hG_.psi_middle_scale_ptr[i], sizeof(hG_.psi_middle_scale_ptr[i]), 0,
+        cudaMemcpyToSymbol(Globals::psi, hG_.psi_ptr[gpu_id], sizeof(Globals::psi), 0, cudaMemcpyHostToDevice);
+        CudaCheckErrorMod;
+        cudaMemcpyToSymbol(G_::psi_no, hG_.psi_no_ptr[gpu_id], sizeof(hG_.psi_no_ptr[gpu_id]), 0,
                            cudaMemcpyHostToDevice);
-CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::inv_psi, hG_.inv_psi_ptr[i], sizeof(hG_.inv_psi_ptr[i]), 0, cudaMemcpyHostToDevice);
-CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::inv_psi_no, hG_.inv_psi_no_ptr[i], sizeof(hG_.inv_psi_no_ptr[i]), 0,
+        CudaCheckErrorMod;
+        cudaMemcpyToSymbol(G_::psi_middle_scale, hG_.psi_middle_scale_ptr[gpu_id],
+                           sizeof(hG_.psi_middle_scale_ptr[gpu_id]), 0, cudaMemcpyHostToDevice);
+        CudaCheckErrorMod;
+        cudaMemcpyToSymbol(G_::inv_psi, hG_.inv_psi_ptr[gpu_id], sizeof(hG_.inv_psi_ptr[gpu_id]), 0,
                            cudaMemcpyHostToDevice);
-CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::inv_psi_middle_scale, hG_.inv_psi_middle_scale_ptr[i],
-                           sizeof(hG_.inv_psi_middle_scale_ptr[i]), 0, cudaMemcpyHostToDevice);
-CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::psi_shoup, hG_.psi_barrett_ptr[i], sizeof(hG_.psi_barrett_ptr[i]), 0,
+        CudaCheckErrorMod;
+        cudaMemcpyToSymbol(G_::inv_psi_no, hG_.inv_psi_no_ptr[gpu_id], sizeof(hG_.inv_psi_no_ptr[gpu_id]), 0,
                            cudaMemcpyHostToDevice);
-CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::inv_psi_shoup, hG_.inv_psi_barrett_ptr[i], sizeof(hG_.inv_psi_barrett_ptr[i]), 0,
+        CudaCheckErrorMod;
+        cudaMemcpyToSymbol(G_::inv_psi_middle_scale, hG_.inv_psi_middle_scale_ptr[gpu_id],
+                           sizeof(hG_.inv_psi_middle_scale_ptr[gpu_id]), 0, cudaMemcpyHostToDevice);
+        CudaCheckErrorMod;
+        cudaMemcpyToSymbol(G_::psi_shoup, hG_.psi_barrett_ptr[gpu_id], sizeof(hG_.psi_barrett_ptr[gpu_id]), 0,
                            cudaMemcpyHostToDevice);
-CudaCheckErrorMod;
+        CudaCheckErrorMod;
+        cudaMemcpyToSymbol(G_::inv_psi_shoup, hG_.inv_psi_barrett_ptr[gpu_id], sizeof(hG_.inv_psi_barrett_ptr[gpu_id]),
+                           0, cudaMemcpyHostToDevice);
+        CudaCheckErrorMod;
+        initialized_gpus.insert(gpu_id);
     }
 
     {
@@ -417,46 +459,44 @@ CudaCheckErrorMod;
             cudaMemcpyToSymbol(Globals::q_inv, hG_.q_inv, bytes, 0, cudaMemcpyHostToDevice);
             CudaCheckErrorMod;
         }
-    }for (size_t j = 0; j < smeta.size(); ++j) {
-                hC_.primeid_special_partition[j] = smeta[j].id;
-             //   hC_.primeid_flattened[SPECIAL(0, j)] = smeta[j].id;
-            }
+    }
+    for (size_t j = 0; j < smeta.size(); ++j) {
+        hC_.primeid_special_partition[j] = smeta[j].id;
+        //   hC_.primeid_flattened[SPECIAL(0, j)] = smeta[j].id;
+    }
 
-            for (size_t i = 0; i < GPUid.size(); ++i) {
-                for (size_t j = 0; j < meta[i].size(); ++j) {
-                    hC_.primeid_partition[i][j] = meta[i][j].id;
-                   // hC_.primeid_flattened[PARTITION(i, j)] = meta[i][j].id;
+    for (size_t i = 0; i < GPUid.size(); ++i) {
+        for (size_t j = 0; j < meta[i].size(); ++j) {
+            hC_.primeid_partition[i][j] = meta[i][j].id;
+            // hC_.primeid_flattened[PARTITION(i, j)] = meta[i][j].id;
+        }
+
+        for (size_t j = 0; j < digitGPUid[i].size(); ++j) {
+            for (int k = 0; k < hC_.L; ++k) {
+                {
+                    int num = 0;
+                    for (auto& l : DECOMPmeta.at(i).at(j))
+                        if (l.id <= k) {
+                            hC_.primeid_digit_from[digitGPUid.at(i).at(j)][num] = l.id;
+                            //  hC_.primeid_flattened[DECOMP(digitGPUid.at(i).at(j), num)] = l.id;
+                            num++;
+                        }
+                    hC_.num_primeid_digit_from[digitGPUid.at(i).at(j)][k] = num;
                 }
 
-                for (size_t j = 0; j < digitGPUid[i].size(); ++j) {
-                    for (int k = 0; k < hC_.L; ++k) {
-                        {
-                            int num = 0;
-                            for (auto& l : DECOMPmeta.at(i).at(j))
-                                if (l.id <= k) {
-                                    hC_.primeid_digit_from[digitGPUid.at(i).at(j)][num] = l.id;
-                                  //  hC_.primeid_flattened[DECOMP(digitGPUid.at(i).at(j), num)] = l.id;
-                                    num++;
-                                }
-                            hC_.num_primeid_digit_from[digitGPUid.at(i).at(j)][k] = num;
+                {
+                    int num = 0;
+                    for (auto& l : DIGITmeta.at(i).at(j))
+                        if (l.id <= k || l.id >= hC_.L) {
+                            hC_.primeid_digit_to[digitGPUid.at(i).at(j)][num] = l.id;
+                            //   hC_.primeid_flattened[DIGIT(digitGPUid.at(i).at(j), num)] = l.id;
+                            num++;
                         }
-
-                        {
-                            int num = 0;
-                            for (auto& l : DIGITmeta.at(i).at(j))
-                                if (l.id <= k || l.id >= hC_.L) {
-                                    hC_.primeid_digit_to[digitGPUid.at(i).at(j)][num] = l.id;
-                                 //   hC_.primeid_flattened[DIGIT(digitGPUid.at(i).at(j), num)] = l.id;
-                                    num++;
-                                }
-                            hC_.num_primeid_digit_to[digitGPUid.at(i).at(j)][k] = num;
-                        }
-                    }
+                    hC_.num_primeid_digit_to[digitGPUid.at(i).at(j)][k] = num;
                 }
             }
-
-
-
+        }
+    }
 
     if constexpr (std::is_same_v<Scheme, CKKS::Parameters>) {
         auto param = static_cast<CKKS::Parameters>(parameters);
@@ -492,8 +532,6 @@ CudaCheckErrorMod;
                     hC_.P_shoup[i] = shoup_precomp(hC_.P[i], i);
                 }
             }
-
-            
 
             {
                 auto& src = param.raw->PHatInvModp;

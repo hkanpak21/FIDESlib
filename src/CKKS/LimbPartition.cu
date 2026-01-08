@@ -339,8 +339,11 @@ void LimbPartition::NTT(int batch, NTT_fusion_fields fields, const int limbsize)
         }
         CudaCheckErrorModNoSync;
 
-        static std::map<int, cudaGraphExec_t> execs;
-        cudaGraphExec_t& exec = execs[limb.size()];
+        static std::map<std::pair<int, int>, cudaGraphExec_t> execs;
+        int current_device;
+        cudaGetDevice(&current_device);
+        auto key = std::make_pair(current_device, (int)limb.size());
+        cudaGraphExec_t& exec = execs[key];
 
         if (!exec) {
             cudaGraphInstantiateWithFlags(&exec, g, 0);
@@ -547,31 +550,22 @@ void LimbPartition::multPt(const LimbPartition& p) {
     cudaSetDevice(device);
 
     constexpr bool capture = false;
-    static std::map<int, cudaGraphExec_t> exec_map;
+    SWITCH(top, mult(p.limb.back()));
+    SWITCH(top, INTT<ALGO_SHOUP>());
 
-    {
-        LimbImpl& top = limb.back();
-
-        cudaGraphExec_t& exec = exec_map[limb.size()];
-
-        run_in_graph<capture>(exec, s, [&]() {
-            STREAM(top).wait(s);
-            SWITCH(top, mult(p.limb.back()));
-            SWITCH(top, INTT<ALGO_SHOUP>());
-
-            for (size_t i = 0; i < limb.size() - 1; i += cc.batch) {
-                STREAM(limb.at(i)).wait(STREAM(top));
-            }
-            NTT<ALGO_SHOUP, NTT_MULTPT>(cc.batch, NTT_fusion_fields{.pt = &p});
-            for (size_t i = 0; i < limb.size() - 1; i += cc.batch) {
-                STREAM(top).wait(STREAM(limb.at(i)));
-            }
-
-            s.wait(STREAM(top));
-        });
-
-        limb.pop_back();
+    for (size_t i = 0; i < limb.size() - 1; i += cc.batch) {
+        STREAM(limb.at(i)).wait(STREAM(top));
     }
+    NTT<ALGO_SHOUP, NTT_MULTPT>(cc.batch, NTT_fusion_fields{.pt = &p});
+    for (size_t i = 0; i < limb.size() - 1; i += cc.batch) {
+        STREAM(top).wait(STREAM(limb.at(i)));
+    }
+
+    s.wait(STREAM(top));
+});
+
+limb.pop_back();
+}
 }
 
 void LimbPartition::modup(int level, LimbPartition& aux_partition) {

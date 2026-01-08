@@ -92,9 +92,9 @@ Context::Context(Parameters param, const std::vector<int>& devs, const int secBi
       limbGPUid(generateLimbGPUid(meta, L)),
       GPUrank(GPUid.size(), -1) {
 
-    if (L+1+K > MAXP) {
-        std::cerr << "Error: too many limbs are needed (" << L + 1 + K <<  "), a maximum of " << MAXP << " is set at FIDESlib's compilation time, aborting."
-         << std::endl;
+    if (L + 1 + K > MAXP) {
+        std::cerr << "Error: too many limbs are needed (" << L + 1 + K << "), a maximum of " << MAXP
+                  << " is set at FIDESlib's compilation time, aborting." << std::endl;
         exit(EXIT_FAILURE);
     }
 
@@ -124,8 +124,8 @@ int Context::computeLogQ(const int L, std::vector<PrimeRecord>& primes) {
 
 int Context::validateDnum(const std::vector<int>& GPUid, const int dnum) {
     if (dnum > MAXD) {
-        std::cerr << "Error: dnum/num_large_digits is set too high (" << dnum << "), a maximum of " << MAXD << " is set at FIDESlib's compilation time, aborting."
-         << std::endl;
+        std::cerr << "Error: dnum/num_large_digits is set too high (" << dnum << "), a maximum of " << MAXD
+                  << " is set at FIDESlib's compilation time, aborting." << std::endl;
         exit(EXIT_FAILURE);
     }
     return dnum;
@@ -428,48 +428,40 @@ int Context::GetBootK() {
     assert(param.raw != nullptr);
     return param.raw ? param.raw->bootK : 1.0;
 }
-
-std::map<int, BootstrapPrecomputation> boot_precomps;
-
-BootstrapPrecomputation& Context::GetBootPrecomputation(int slots) {
-    if (!boot_precomps.contains(slots))
+BootstrapPrecomputation& Context::GetBootPrecomputation(int slots) const {
+    if (!boot_precomps_.contains(slots))
         assert("No precomputation." == nullptr);
-    return boot_precomps[slots];
+    return boot_precomps_[slots];
 }
-
-std::map<int, KeySwitchingKey> rot_keys;
-
 KeySwitchingKey& Context::GetRotationKey(int index) {
     //index = index % (cc.N / 2);
     if (index < 0)
         index += this->N / 2;
-    return rot_keys.at(index);
+    return rot_keys_.at(index);
 }
 void Context::AddRotationKey(int index, KeySwitchingKey&& ksk) {
     //index = index % (cc.N / 2);
     if (index < 0)
         index += this->N / 2;
-    rot_keys.emplace(index, std::move(ksk));
+    rot_keys_.emplace(index, std::move(ksk));
 }
 bool Context::HasRotationKey(int index) {
     //index = index % (cc.N / 2);
     if (index < 0)
         index += this->N / 2;
-    return rot_keys.contains(index);
+    return rot_keys_.contains(index);
 }
-
-std::optional<KeySwitchingKey> eval_key;
 
 void Context::AddEvalKey(KeySwitchingKey&& ksk) {
-    eval_key.emplace(std::move(ksk));
+    eval_key_.emplace(std::move(ksk));
 }
 KeySwitchingKey& Context::GetEvalKey() {
-    return eval_key.value();
+    return eval_key_.value();
 }
 Context::~Context() {
-    eval_key.reset();
-    rot_keys.clear();
-    boot_precomps.clear();
+    eval_key_.reset();
+    rot_keys_.clear();
+    boot_precomps_.clear();
 }
 
 void Context::AddBootPrecomputation(int slots, BootstrapPrecomputation&& precomp) const {
@@ -492,7 +484,7 @@ void Context::AddBootPrecomputation(int slots, BootstrapPrecomputation&& precomp
                   << "MB\n";
     }
 
-    boot_precomps.emplace(slots, std::move(precomp));
+    boot_precomps_.emplace(slots, std::move(precomp));
 }
 
 Context::RESCALE_TECHNIQUE Context::translateRescalingTechnique(lbcrypto::ScalingTechnique technique) {
