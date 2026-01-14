@@ -197,6 +197,107 @@ Key observations from benchmarking:
 \end{itemize}
 
 % ==========================================================
+\section{Latency Bottleneck Analysis}
+To understand where time is spent in HE operations, I implemented comprehensive performance monitoring using CUDA events for precise GPU timing. The benchmark breaks down each phase of the HE pipeline.
+
+\subsection{End-to-End Latency Breakdown}
+\begin{table}[h]
+\centering
+\footnotesize
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Phase} & \textbf{Time (ms)} & \textbf{\% Total} & \textbf{Location} \\
+\midrule
+CPU Encryption & 36,018 & 91.63\% & CPU (OpenFHE) \\
+Key Generation & 1,887 & 4.80\% & CPU (OpenFHE) \\
+H2D Transfer & 398 & 1.01\% & PCIe Bus \\
+Context Setup & 391 & 0.99\% & CPU \\
+Key Loading & 317 & 0.81\% & GPU Memory \\
+\textbf{GPU Compute} & \textbf{297} & \textbf{0.76\%} & \textbf{GPU} \\
+\midrule
+\textbf{Total} & 39,307 & 100\% & --- \\
+\bottomrule
+\end{tabular}
+\caption{End-to-end latency breakdown for 64 HE multiplications (logN=14, L=12, 5 iterations). CPU encryption dominates at 91.6\%.}
+\label{tab:latency}
+\end{table}
+
+\textbf{Key Finding:} CPU-side encryption (performed by OpenFHE) dominates the end-to-end pipeline at 91.6\% of total time. The actual GPU compute accounts for only 0.76\% of wall-clock time, demonstrating that FIDESlib's GPU kernels are highly efficient.
+
+\subsection{Implications for Real Workloads}
+\begin{itemize}[noitemsep]
+    \item \textbf{Pre-encryption strategy}: For production systems, data should be pre-encrypted before GPU batch processing to amortize encryption cost.
+    \item \textbf{GPU compute is not the bottleneck}: Multi-GPU scaling provides the most benefit when operating on already-encrypted data.
+    \item \textbf{Memory transfer overhead}: H2D transfers (1.01\%) are minimal compared to CPU encryption, validating the GPU-accelerated approach.
+\end{itemize}
+
+% ==========================================================
+\section{Pure GPU Compute Performance (Within-Node)}
+To isolate the true multi-GPU scaling efficiency, I measured only the GPU compute phase, excluding CPU encryption, key generation, and memory transfers. This represents the performance users will observe when operating on pre-encrypted ciphertexts.
+
+\subsection{GPU-Only Timing Results}
+\begin{table}[h]
+\centering
+\footnotesize
+\begin{tabular}{lrrrrc}
+\toprule
+\textbf{Config (ops$\times$iters)} & \textbf{1 GPU} & \textbf{4 GPU} & \textbf{Speedup} & \textbf{Eff.} & \textbf{Imbalance} \\
+\midrule
+32$\times$5 (160 ops) & 140.1 ms & 64.1 ms & \textbf{2.19$\times$} & 54.7\% & 16.1\% \\
+64$\times$5 (320 ops) & 296.8 ms & 121.3 ms & \textbf{2.45$\times$} & 61.2\% & 2.9\% \\
+\bottomrule
+\end{tabular}
+\caption{Pure GPU compute scaling (logN=14, L=12). Larger workloads achieve better efficiency due to reduced synchronization overhead.}
+\label{tab:gpu-only}
+\end{table}
+
+\subsection{Per-GPU Load Balance}
+With 64 operations distributed across 4 GPUs (16 ops each):
+\begin{table}[h]
+\centering
+\footnotesize
+\begin{tabular}{lrr}
+\toprule
+\textbf{GPU} & \textbf{Time (ms)} & \textbf{Ops Assigned} \\
+\midrule
+GPU 0 & 117.9 & 16 \\
+GPU 1 & 120.6 & 16 \\
+GPU 2 & 120.8 & 16 \\
+GPU 3 & 117.3 & 16 \\
+\midrule
+\textbf{Average} & 119.2 & --- \\
+\textbf{Imbalance} & 2.93\% & --- \\
+\bottomrule
+\end{tabular}
+\caption{Per-GPU execution times showing excellent load balance.}
+\end{table}
+
+\subsection{Throughput Comparison}
+\begin{table}[h]
+\centering
+\footnotesize
+\begin{tabular}{lrr}
+\toprule
+\textbf{Configuration} & \textbf{1 GPU} & \textbf{4 GPU} \\
+\midrule
+HE-mults/sec (32 ops) & 1,142 & 2,498 \\
+HE-mults/sec (64 ops) & 1,078 & 2,639 \\
+\bottomrule
+\end{tabular}
+\caption{GPU compute throughput (excluding CPU overhead).}
+\end{table}
+
+\subsection{Scaling Efficiency Analysis}
+The measured efficiency of 61.2\% at 4 GPUs (for larger workloads) is attributed to:
+\begin{itemize}[noitemsep]
+    \item \textbf{Thread synchronization}: Each GPU runs in a separate CPU thread; barrier synchronization adds overhead.
+    \item \textbf{PCIe contention}: All 4 GPUs share the PCIe bus for memory operations.
+    \item \textbf{Context switching}: CUDA runtime overhead when managing multiple devices.
+\end{itemize}
+
+\textbf{Workload scaling}: Larger workloads (64 ops vs 32 ops) improve efficiency from 54.7\% to 61.2\% because the fixed synchronization overhead is amortized over more compute operations.
+
+% ==========================================================
 \section{Multi-GPU Usage Pattern}
 The implemented solution allows users to create independent GPU contexts:
 \begin{lstlisting}
@@ -243,10 +344,11 @@ This project successfully transformed FIDESlib into a multi-GPU capable library.
     \item \textbf{Architectural refactoring}: Converted static global state to per-context instance members, enabling independent GPU operation.
     \item \textbf{Device-aware caching}: Modified CUDA graph caches to include device ID, preventing cross-device corruption.
     \item \textbf{Robust initialization}: Implemented GPU tracking to ensure proper constant memory setup on all devices.
-    \item \textbf{Comprehensive benchmarking}: Developed a benchmark suite demonstrating \textbf{2.27$\times$ speedup with 4 GPUs}.
+    \item \textbf{Comprehensive benchmarking}: Developed a benchmark suite demonstrating \textbf{2.45$\times$ speedup with 4 GPUs} on pure GPU compute.
+    \item \textbf{Performance analysis}: Identified CPU encryption as the dominant bottleneck (91.6\% of end-to-end time), validating the importance of GPU acceleration for compute-bound operations.
 \end{enumerate}
 
-The implementation is GPU-count agnostic and has been validated on up to 4$\times$ NVIDIA L4 GPUs. The solution achieves throughput improvements from 1422 ops/sec (1 GPU) to 3130 ops/sec (4 GPUs). Future work could explore NVLink interconnects for reduced communication overhead.
+The implementation achieves 61.2\% parallel efficiency on 4 GPUs with excellent load balance (2.93\% imbalance). GPU compute throughput scales from 1,078 HE-mults/sec (1 GPU) to 2,639 HE-mults/sec (4 GPUs). Future work could explore NVLink interconnects for reduced communication overhead and GPU-side encryption to eliminate the CPU bottleneck.
 
 \textbf{Repository:} \href{https://github.com/hkanpak21/FIDESlib}{github.com/hkanpak21/FIDESlib}
 
