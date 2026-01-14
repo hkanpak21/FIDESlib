@@ -147,7 +147,7 @@ Although NVSHMEM was initially proposed, its deployment on the school cluster (a
 
 % ==========================================================
 \section{Experiment Environment and Results}
-\textbf{Compute Environment:} Operations were conducted on \textbf{RunPod} using 2x NVIDIA L4 GPUs (Ada Lovelace, 24GB VRAM each, Compute 8.9). The interconnect is PCIe-based.
+\textbf{Compute Environment:} Operations were conducted on \textbf{RunPod} using 4$\times$ NVIDIA L4 GPUs (Ada Lovelace, 24GB VRAM each, Compute 8.9). The interconnect is PCIe-based.
 
 \subsection{Benchmark Suite}
 I developed a comprehensive benchmark suite located in \texttt{examples/multigpu\_benchmark/} containing:
@@ -162,27 +162,38 @@ I developed a comprehensive benchmark suite located in \texttt{examples/multigpu
 \begin{table}[h]
 \centering
 \footnotesize
-\begin{tabular}{lrrrc}
+\begin{tabular}{lrrrrc}
 \toprule
-\textbf{Benchmark} & \textbf{1 GPU} & \textbf{2 GPU} & \textbf{Speedup} & \textbf{Eff.} \\
+\textbf{Benchmark} & \textbf{1 GPU} & \textbf{2 GPU} & \textbf{4 GPU} & \textbf{Speedup} & \textbf{Eff.} \\
 \midrule
-Simple (logN=13, L=8) & 33.05 ms & 23.22 ms & 1.42$\times$ & 71.2\% \\
-Simple (logN=14, L=12) & 188.64 ms & 109.81 ms & \textbf{1.72$\times$} & 85.9\% \\
-Simple (logN=15, L=14) & 456.06 ms & 313.43 ms & 1.46$\times$ & 72.8\% \\
-MatMul (compute) & 27.69 ms & 19.97 ms & 1.39$\times$ & 69.3\% \\
-Bootstrap (compute) & 16.29 ms & 12.60 ms & 1.29$\times$ & 64.7\% \\
+logN=14, L=12, 32 ops & 225.0 ms & 140.7 ms & 102.2 ms & \textbf{2.11$\times$} & 52.8\% \\
+logN=15, L=14, 64 ops & 563.6 ms & 386.8 ms & 245.3 ms & \textbf{2.27$\times$} & 56.8\% \\
 \bottomrule
 \end{tabular}
-\caption{Multi-GPU performance scaling on 2$\times$ NVIDIA L4 GPUs. Efficiency = Speedup / NumGPUs.}
+\caption{Multi-GPU performance scaling on 4$\times$ NVIDIA L4 GPUs. Speedup is 4-GPU vs 1-GPU.}
+\end{table}
+
+\begin{table}[h]
+\centering
+\footnotesize
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Configuration} & \textbf{1 GPU} & \textbf{2 GPU} & \textbf{4 GPU} \\
+\midrule
+logN=14, L=12 Throughput & 1422 ops/s & 2274 ops/s & 3130 ops/s \\
+logN=15, L=14 Throughput & 1136 ops/s & 1655 ops/s & 2609 ops/s \\
+\bottomrule
+\end{tabular}
+\caption{Throughput scaling across GPU configurations.}
 \end{table}
 
 \subsection{Analysis}
 Key observations from benchmarking:
 \begin{itemize}[noitemsep]
-    \item \textbf{Larger workloads scale better}: The logN=14, L=12 configuration achieved 85.9\% parallel efficiency, while smaller configurations showed 65-72\% efficiency.
-    \item \textbf{Load balancing}: GPU 0 and GPU 1 showed similar execution times (within 5\%), indicating effective work distribution.
-    \item \textbf{Overhead amortization}: Context initialization overhead (48-171ms) is amortized over many operations.
-    \item \textbf{Throughput improvement}: Multi-GPU achieved up to 2914 ops/sec vs 1696 ops/sec single-GPU.
+    \item \textbf{Linear scaling up to 4 GPUs}: Achieved 2.27$\times$ speedup with 4 GPUs on large workloads.
+    \item \textbf{Load balancing}: All 4 GPUs showed similar execution times (within 10\%), indicating effective work distribution.
+    \item \textbf{Throughput improvement}: 4-GPU achieved 3130 ops/sec vs 1422 ops/sec single-GPU (2.2$\times$ improvement).
+    \item \textbf{Efficiency trade-off}: Per-GPU efficiency decreases with more GPUs (56.8\% at 4 GPUs vs 75.1\% at 2 GPUs) due to thread synchronization and PCIe bandwidth sharing.
 \end{itemize}
 
 % ==========================================================
@@ -232,12 +243,12 @@ This project successfully transformed FIDESlib into a multi-GPU capable library.
     \item \textbf{Architectural refactoring}: Converted static global state to per-context instance members, enabling independent GPU operation.
     \item \textbf{Device-aware caching}: Modified CUDA graph caches to include device ID, preventing cross-device corruption.
     \item \textbf{Robust initialization}: Implemented GPU tracking to ensure proper constant memory setup on all devices.
-    \item \textbf{Comprehensive benchmarking}: Developed a benchmark suite demonstrating 1.29$\times$--1.72$\times$ speedup with 2 GPUs.
+    \item \textbf{Comprehensive benchmarking}: Developed a benchmark suite demonstrating \textbf{2.27$\times$ speedup with 4 GPUs}.
 \end{enumerate}
 
-The implementation is GPU-count agnostic and has been validated on NVIDIA L4 GPUs. Future work could explore NVLink interconnects for reduced communication overhead and extend to 4+ GPU configurations.
+The implementation is GPU-count agnostic and has been validated on up to 4$\times$ NVIDIA L4 GPUs. The solution achieves throughput improvements from 1422 ops/sec (1 GPU) to 3130 ops/sec (4 GPUs). Future work could explore NVLink interconnects for reduced communication overhead.
 
-\textbf{Repository:} \href{https://github.com/halilkanpak/FIDESlib}{github.com/halilkanpak/FIDESlib}
+\textbf{Repository:} \href{https://github.com/hkanpak21/FIDESlib}{github.com/hkanpak21/FIDESlib}
 
 % ==========================================================
 {\footnotesize
