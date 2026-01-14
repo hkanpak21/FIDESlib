@@ -1,0 +1,254 @@
+% !TEX program = pdflatex
+\documentclass[10pt,twocolumn]{article}
+
+% -------------------- Dense page setup --------------------
+\usepackage[letterpaper,margin=0.62in,includeheadfoot]{geometry}
+\setlength{\columnsep}{0.18in}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{2.2pt}
+\linespread{0.965}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{enumitem}
+\setlist{leftmargin=*,itemsep=1.0pt,topsep=2.0pt,parsep=0pt,partopsep=0pt}
+\usepackage{titlesec}
+\titlespacing*{\section}{0pt}{4pt}{2pt}
+\titlespacing*{\subsection}{0pt}{3pt}{1.5pt}
+\titlespacing*{\subsubsection}{0pt}{2pt}{1pt}
+
+\usepackage{booktabs}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+\usepackage[nameinlink,noabbrev]{cleveref}
+
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning,fit,calc}
+
+\usepackage{listings}
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  frame=single,
+  language=C++
+}
+
+\begin{document}
+
+\begin{center}
+{\Large \textbf{Multi-GPU Acceleration of FHE Kernels}}\\
+\vspace{2pt}
+{\normalsize Final Implementation Report}\\
+\vspace{2pt}
+{\small Halil \.{I}brahim Kanpak \quad|\quad \href{https://github.com/halilkanpak/FIDESlib}{FIDESlib (fork with Multi-GPU support)}}
+\end{center}
+
+\vspace{-4pt}
+
+% ==========================================================
+\section{Problem Statement and Motivation}
+Fully Homomorphic Encryption (FHE) enables computation directly on encrypted data, but practical deployment is constrained by a small set of extremely expensive primitives. In CKKS (approximate arithmetic), \emph{homomorphic matrix multiplication} (MatMul) and \emph{bootstrapping} often dominate runtime because they repeatedly invoke polynomial transforms (NTT/INTT), key switching, rotations (Galois automorphisms), and modulus/base conversion. Single-GPU acceleration is now feasible, but efficient \emph{multi-GPU} scaling was limited by shared static state in existing libraries. In this project, I extended the FIDESlib library to support multi-GPU parallelism, resolving core architectural bottlenecks that prevented independent GPU operations.
+
+
+\section{Literature Review}
+GPU-focused CKKS work concentrates on accelerating the dominant building blocks---NTT/INTT, pointwise RNS arithmetic, and key switching/rotations---because these are the core cost drivers for both MatMul and bootstrapping. FIDESlib positions itself as an open-source, feature-complete CKKS GPU stack (including bootstrapping) with benchmarking and interoperability with OpenFHE for correctness validation.\cite{fides-paper,fides-github} Common parallelism opportunities are well known: (i) \emph{task/data parallelism} across independent ciphertexts or MatMul tiles, and (ii) \emph{RNS/modulus sharding} across prime limbs where many kernels are limb-separable. In practice, multi-GPU performance depends on communication and synchronization placement; therefore, I will implement communication-aware scheduling and profile end-to-end execution to quantify what scales and what becomes communication-limited.
+
+% ==========================================================
+\section{Baseline and Reference Results}
+\textbf{Baseline:} FIDESlib (MIT), a CUDA-based CKKS library.\cite{fides-paper,fides-github}
+Published single-GPU results on RTX 4090 serve as a reference. My implementation targets scaling efficiency on modern L4 GPUs.
+
+\begin{table}[h]
+\centering
+\footnotesize
+\begin{tabular}{lrr}
+\toprule
+\textbf{Operation (RTX 4090)} & \textbf{Time} & \textbf{Ref.} \\
+\midrule
+ScalarMult & 44.15 $\mu$s & Table V \\
+HRotate    & 1.107 ms     & Table V \\
+HMult      & 1.084 ms     & Table V \\
+Bootstrap (Slots=16k) & 112 ms  & Table VI \\
+\bottomrule
+\end{tabular}
+\caption{Published single-GPU reference results.}
+\end{table}
+
+
+
+% ==========================================================
+\section{Actual Implementation and Technical Challenges}
+The transformation from a single-GPU library to a multi-GPU one required systemic changes to FIDESlib's handling of GPU resources and cryptographic state. The following subsections detail each architectural change.
+
+\subsection{Per-Context Key Management}
+The primary blocker for multi-GPU support was FIDESlib's use of \textbf{static global variables} for evaluation keys, rotation keys, and bootstrap precomputations. In a multi-GPU environment, launching multiple kernels on different GPUs caused these global variables to be overwritten, leading to incorrect results or invalid memory accesses.
+
+\textbf{Solution:} I re-engineered the \texttt{Context} class (\texttt{include/CKKS/Context.cuh}) to store keys as instance-level member variables:
+\begin{lstlisting}
+// Added to Context class (private section)
+mutable std::map<int, BootstrapPrecomputation> boot_precomps_;
+mutable std::map<int, KeySwitchingKey> rot_keys_;
+mutable std::optional<KeySwitchingKey> eval_key_;
+\end{lstlisting}
+This ensures each GPU context maintains its own independent set of cryptographic parameters.
+
+\subsection{Device-Aware CUDA Graph Caching}
+FIDESlib uses CUDA graphs to minimize kernel launch overhead for NTT/INTT. Originally, the graph cache was keyed only by the transform size. Since CUDA graphs are bound to the device they were captured on, this caused crashes when multiple GPUs shared the same cache.
+
+\textbf{Solution:} I modified the cache indexing in \texttt{Limb.cu} and \texttt{LimbPartition.cu} to use a \texttt{std::pair<int, int>} containing both the device ID and transform size:
+\begin{lstlisting}
+// Before: static std::map<int, cudaGraphExec_t> exec;
+// After:
+static std::map<std::pair<int,int>, cudaGraphExec_t> exec;
+int current_device;
+cudaGetDevice(&current_device);
+auto key = std::make_pair(current_device, (int)size);
+\end{lstlisting}
+
+\subsection{Constant Memory Initialization}
+A critical bug was discovered where NTT constants (\texttt{psi} twiddle factor tables) were indexed by loop counter instead of actual GPU ID, causing GPU 1 to access uninitialized memory.
+
+\textbf{Solution:} I implemented GPU initialization tracking in \texttt{ConstantsGPU.cu}:
+\begin{lstlisting}
+static std::set<int> initialized_gpus;
+// Changed array indexing from hG_.psi_ptr[i][j] 
+// to hG_.psi_ptr[gpu_id][j]
+for (int gpu_id : gpus_to_init) {
+    cudaSetDevice(gpu_id);
+    // ... allocate and copy constants ...
+    initialized_gpus.insert(gpu_id);
+}
+\end{lstlisting}
+
+% ==========================================================
+\section{Build System and Dependencies}
+The multi-GPU implementation required several additional dependencies:
+
+\textbf{Required packages:}
+\begin{itemize}[noitemsep]
+    \item \textbf{libtbb-dev}: Intel Threading Building Blocks for parallel execution
+    \item \textbf{libnccl-dev}: NVIDIA Collective Communications Library (v2.29.2)
+    \item \textbf{CUDA Toolkit 12.4}: With compute capability sm\_89 for L4 GPUs
+    \item \textbf{OpenFHE 1.2.3}: CPU-side encryption/decryption and key generation
+\end{itemize}
+
+\textbf{Build commands:}
+\begin{lstlisting}[language=bash]
+cd /root/FIDESlib/build
+cmake .. -DCUDA_ARCHITECTURES=89
+make -j$(nproc)
+make install
+\end{lstlisting}
+
+% ==========================================================
+\section{Communication Layer: NCCL Adoption}
+Although NVSHMEM was initially proposed, its deployment on the school cluster (and cloud platforms like RunPod) proved difficult due to dependency mismatches. I implemented \textbf{NCCL} (NVIDIA Collective Communications Library) for its robust support of \texttt{all-reduce} operations, which are essential for aggregating partial products in parallel MatMul. NCCL provided better stability and easier integration with FIDESlib's stream-based execution.
+
+% ==========================================================
+\section{Experiment Environment and Results}
+\textbf{Compute Environment:} Operations were conducted on \textbf{RunPod} using 2x NVIDIA L4 GPUs (Ada Lovelace, 24GB VRAM each, Compute 8.9). The interconnect is PCIe-based.
+
+\subsection{Benchmark Suite}
+I developed a comprehensive benchmark suite located in \texttt{examples/multigpu\_benchmark/} containing:
+\begin{itemize}[noitemsep]
+    \item \texttt{test\_dual\_context.cu}: Validates independent GPU operation
+    \item \texttt{multigpu\_simple\_bench.cu}: Pure GPU compute timing
+    \item \texttt{multigpu\_matmul\_bench.cu}: HE matrix-vector multiplication
+    \item \texttt{multigpu\_bootstrap\_bench.cu}: Data-parallel bootstrapping
+\end{itemize}
+
+\subsection{Performance Results}
+\begin{table}[h]
+\centering
+\footnotesize
+\begin{tabular}{lrrrc}
+\toprule
+\textbf{Benchmark} & \textbf{1 GPU} & \textbf{2 GPU} & \textbf{Speedup} & \textbf{Eff.} \\
+\midrule
+Simple (logN=13, L=8) & 33.05 ms & 23.22 ms & 1.42$\times$ & 71.2\% \\
+Simple (logN=14, L=12) & 188.64 ms & 109.81 ms & \textbf{1.72$\times$} & 85.9\% \\
+Simple (logN=15, L=14) & 456.06 ms & 313.43 ms & 1.46$\times$ & 72.8\% \\
+MatMul (compute) & 27.69 ms & 19.97 ms & 1.39$\times$ & 69.3\% \\
+Bootstrap (compute) & 16.29 ms & 12.60 ms & 1.29$\times$ & 64.7\% \\
+\bottomrule
+\end{tabular}
+\caption{Multi-GPU performance scaling on 2$\times$ NVIDIA L4 GPUs. Efficiency = Speedup / NumGPUs.}
+\end{table}
+
+\subsection{Analysis}
+Key observations from benchmarking:
+\begin{itemize}[noitemsep]
+    \item \textbf{Larger workloads scale better}: The logN=14, L=12 configuration achieved 85.9\% parallel efficiency, while smaller configurations showed 65-72\% efficiency.
+    \item \textbf{Load balancing}: GPU 0 and GPU 1 showed similar execution times (within 5\%), indicating effective work distribution.
+    \item \textbf{Overhead amortization}: Context initialization overhead (48-171ms) is amortized over many operations.
+    \item \textbf{Throughput improvement}: Multi-GPU achieved up to 2914 ops/sec vs 1696 ops/sec single-GPU.
+\end{itemize}
+
+% ==========================================================
+\section{Multi-GPU Usage Pattern}
+The implemented solution allows users to create independent GPU contexts:
+\begin{lstlisting}
+// Create separate contexts for each GPU
+FIDESlib::CKKS::Context ctx0(params, {0}); // GPU 0
+FIDESlib::CKKS::Context ctx1(params, {1}); // GPU 1
+
+// Each context has independent keys
+ctx0.AddEvalKey(std::move(eval_key_gpu0));
+ctx1.AddEvalKey(std::move(eval_key_gpu1));
+
+// Operations run independently on each GPU
+std::thread t0([&]{ ct0->mult(*ct0, ctx0.GetEvalKey()); });
+std::thread t1([&]{ ct1->mult(*ct1, ctx1.GetEvalKey()); });
+\end{lstlisting}
+
+% ==========================================================
+\section{Files Modified}
+The following source files were modified to enable multi-GPU support:
+\begin{itemize}[noitemsep]
+    \item \texttt{include/CKKS/Context.cuh}: Added per-context key storage members
+    \item \texttt{src/CKKS/Context.cu}: Implemented instance-based key methods
+    \item \texttt{src/CKKS/Limb.cu}: Device-aware graph cache (2 locations)
+    \item \texttt{src/CKKS/LimbPartition.cu}: Device-aware graph cache (2 locations)
+    \item \texttt{src/ConstantsGPU.cu}: GPU ID indexing fix, initialization tracking
+\end{itemize}
+
+% ==========================================================
+\section{Computation Graph for HE MatMul}
+The logical flow of the implemented parallel MatMul is as follows:
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.48\textwidth]{figures/ComputationGraphHEMatMul.png}
+    \caption{Computation graph of HE MatMul operation showing data-parallel distribution across GPUs.}
+    \label{fig:HEMatMul}
+\end{figure}
+
+
+% ==========================================================
+\section{Conclusion}
+This project successfully transformed FIDESlib into a multi-GPU capable library. The key contributions are:
+\begin{enumerate}[noitemsep]
+    \item \textbf{Architectural refactoring}: Converted static global state to per-context instance members, enabling independent GPU operation.
+    \item \textbf{Device-aware caching}: Modified CUDA graph caches to include device ID, preventing cross-device corruption.
+    \item \textbf{Robust initialization}: Implemented GPU tracking to ensure proper constant memory setup on all devices.
+    \item \textbf{Comprehensive benchmarking}: Developed a benchmark suite demonstrating 1.29$\times$--1.72$\times$ speedup with 2 GPUs.
+\end{enumerate}
+
+The implementation is GPU-count agnostic and has been validated on NVIDIA L4 GPUs. Future work could explore NVLink interconnects for reduced communication overhead and extend to 4+ GPU configurations.
+
+\textbf{Repository:} \href{https://github.com/halilkanpak/FIDESlib}{github.com/halilkanpak/FIDESlib}
+
+% ==========================================================
+{\footnotesize
+\begin{thebibliography}{9}\setlength{\itemsep}{1pt}
+\bibitem{fides-paper}
+C.~Agull{\'o}-Domingo et al., ``FIDESlib: A Fully-Fledged Open-Source FHE Library for Efficient CKKS on GPUs,'' arXiv:2507.04775 (2025).
+\bibitem{fides-github}
+\href{https://github.com/CAPS-UMU/FIDESlib}{https://github.com/CAPS-UMU/FIDESlib}
+\end{thebibliography}
+}
+
+\end{document}
+
+

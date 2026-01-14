@@ -1,0 +1,179 @@
+% !TEX program = pdflatex
+\documentclass[10pt,twocolumn]{article}
+
+% -------------------- Dense page setup --------------------
+\usepackage[letterpaper,margin=0.62in,includeheadfoot]{geometry}
+\setlength{\columnsep}{0.18in}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{2.2pt}
+\linespread{0.965}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{enumitem}
+\setlist{leftmargin=*,itemsep=1.0pt,topsep=2.0pt,parsep=0pt,partopsep=0pt}
+\usepackage{titlesec}
+\titlespacing*{\section}{0pt}{4pt}{2pt}
+\titlespacing*{\subsection}{0pt}{3pt}{1.5pt}
+\titlespacing*{\subsubsection}{0pt}{2pt}{1pt}
+
+\usepackage{booktabs}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+\usepackage[nameinlink,noabbrev]{cleveref}
+
+\begin{document}
+
+\begin{center}
+{\Large \textbf{Multi-GPU Acceleration of FHE Kernels}}\\
+\vspace{2pt}
+{\normalsize Parallel Programming Project Proposal}\\
+\vspace{2pt}
+{\small Halil \.{I}brahim Kanpak \quad|\quad \href{https://github.com/CAPS-UMU/FIDESlib}{FIDESlib (open-source baseline)}}
+\end{center}
+
+\vspace{-4pt}
+
+% ==========================================================
+\section{Problem Statement and Motivation}
+Fully Homomorphic Encryption (FHE) enables computation directly on encrypted data, but practical deployment is constrained by a small set of extremely expensive primitives. In CKKS (approximate arithmetic), \emph{homomorphic matrix multiplication} (MatMul) and \emph{bootstrapping} often dominate runtime because they repeatedly invoke polynomial transforms (NTT/INTT), key switching, rotations (Galois automorphisms), and modulus/base conversion. Single-GPU acceleration is now feasible in open source, but efficient \emph{multi-GPU} scaling remains engineering-heavy: I must choose a partitioning strategy, manage GPU-to-GPU communication, and instrument call stacks / computation graphs to identify where time is spent. In this project, I will extend an open-source CKKS GPU implementation to multi-GPU, measure scaling on the school cluster, and produce concrete artifacts (DAGs, traces, and communication benchmarks) that show how MatMul and bootstrapping behave under multi-GPU parallelization. Both CKKS MatMul and bootstrapping expose natural parallel structure across ciphertexts, output tiles, and RNS limbs, indicating that single-GPU execution leaves available hardware parallelism unused on multi-GPU nodes. A multi-GPU implementation makes it possible to determine which CKKS subroutines scale with additional devices and which are fundamentally limited by communication and synchronization.
+
+% ==========================================================
+\section{Literature Review}
+GPU-focused CKKS work concentrates on accelerating the dominant building blocks---NTT/INTT, pointwise RNS arithmetic, and key switching/rotations---because these are the core cost drivers for both MatMul and bootstrapping. FIDESlib positions itself as an open-source, feature-complete CKKS GPU stack (including bootstrapping) with benchmarking and interoperability with OpenFHE for correctness validation.\cite{fides-paper,fides-github} Common parallelism opportunities are well known: (i) \emph{task/data parallelism} across independent ciphertexts or MatMul tiles, and (ii) \emph{RNS/modulus sharding} across prime limbs where many kernels are limb-separable. In practice, multi-GPU performance depends on communication and synchronization placement; therefore, I will implement communication-aware scheduling and profile end-to-end execution to quantify what scales and what becomes communication-limited.
+
+% ==========================================================
+\section{Selected Open-Source Baseline and Reference Results}
+\textbf{Baseline choice.} I will build on \textbf{FIDESlib} (MIT), a CUDA-based CKKS library that implements core CKKS primitives including bootstrapping and is designed to interoperate with OpenFHE.\cite{fides-paper,fides-github} OpenFHE will serve as the CPU correctness reference (decrypt-and-compare) and as a CPU performance context; unmodified FIDESlib will serve as the 1-GPU baseline.
+
+\textbf{Published single-GPU reference results (FIDESlib on RTX 4090).}
+FIDESlib reports primitive latencies for a maximum-level ciphertext and also reports end-to-end bootstrapping and an encrypted logistic regression benchmark. I will use these numbers as a \emph{reference point} for validating my experimental setup and for reporting comparisons in the final report (my main speedup metric will be vs.\ my reproduced 1-GPU FIDESlib baseline on the cluster).
+
+\vspace{-2pt}
+\begin{table}[t]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Operation (RTX 4090)} & \textbf{Time} & \textbf{Ref.} \\
+\midrule
+ScalarAdd & 16.63 $\mu$s & Table V \\
+PtAdd     & 17.79 $\mu$s & Table V \\
+HAdd      & 50.70 $\mu$s & Table V \\
+ScalarMult& 44.15 $\mu$s & Table V \\
+PtMult    & 21.74 $\mu$s & Table V \\
+Rescale   & 156.11 $\mu$s& Table V \\
+HRotate   & 1.107 ms     & Table V \\
+HMult     & 1.084 ms     & Table V \\
+\midrule
+Bootstrap (Slots=64, Levels=13)     & 73.5 ms & Table VI \\
+Bootstrap (Slots=512, Levels=11)    & 93.3 ms & Table VI \\
+Bootstrap (Slots=16384, Levels=9)   & 112 ms  & Table VI \\
+Bootstrap (Slots=32768, Levels=9)   & 146 ms  & Table VI \\
+\midrule
+LR Iteration + Bootstrap            & 169 ms  & Table VII \\
+\bottomrule
+\end{tabular}
+\vspace{-2pt}
+\caption{Published FIDESlib single-GPU reference results (RTX 4090).}
+\vspace{-6pt}
+\end{table}
+
+% ==========================================================
+\section{Parallelization Strategy}
+\subsection{Target operations and bottlenecks}
+\begin{itemize}
+  \item \textbf{CKKS MatMul:} implemented using packed SIMD encodings; decomposes into ciphertext multiplications, rotations, and additions. Rotations trigger key switching; therefore, \texttt{Rotate+KeySwitch} and (i)NTT are expected hotspots.
+  \item \textbf{CKKS Bootstrapping:} refreshes ciphertexts to reset noise/precision loss; dominated by repeated (i)NTT, rotations/key switching, and modulus/base conversions.
+\end{itemize}
+
+\subsection{Programming models and communication libraries (no OpenMP)}
+\begin{itemize}
+  \item \textbf{CUDA C++} for kernels and GPU-side optimization (NTT/INTT, pointwise ops, key switching subroutines, kernel fusions).
+  \item \textbf{NCCL} for intra-node multi-GPU collectives (all-reduce/all-gather) and as the primary communication backend (confirmed available on the cluster and loadable via modules).
+  \item \textbf{CUDA P2P} (\texttt{cudaMemcpyPeerAsync}) as a point-to-point baseline for transfers and for comparison against NCCL where appropriate.
+  \item \textbf{MPI (optional)} only if I extend to multi-node experiments; otherwise I will focus on single-node multi-GPU execution.
+  \item \textbf{NVSHMEM (attempted):} the cluster does not provide an NVSHMEM module and NVSHMEM headers/libs were not found under the available NVHPC module by default. I will attempt a user-space build; if it is not feasible, I will proceed with NCCL-based experiments and document NVSHMEM availability status in the report.
+\end{itemize}
+
+\subsection{Baseline and starting point}
+\textbf{Baseline:} Unmodified FIDESlib (1 GPU) as the GPU baseline.\cite{fides-paper,fides-github}
+\textbf{Existing implementation:} FIDESlib already provides an optimized single-GPU implementation; I will implement and evaluate a multi-GPU execution path and provide profiling/analysis artifacts.
+
+\subsection{Multi-GPU decomposition modes I will implement and examine}
+\textbf{Mode A (Task/Data Parallelism: throughput).}
+I will distribute independent ciphertext tasks across GPUs (batch bootstraps; MatMul output tiles/diagonals; independent rotations) to scale throughput with minimal communication. Where partial outputs must be combined (e.g., MatMul output accumulation), I will use NCCL reductions and compare against CUDA P2P baselines.
+
+% \textbf{Mode B (RNS/Modulus Sharding: stage-level latency analysis).}
+% I will shard RNS prime limbs across GPUs for limb-separable kernels (NTT/INTT and pointwise arithmetic). I will identify cross-limb steps (e.g., parts of base conversion/key switching) that require synchronization/communication, then measure how those steps bound latency scaling on a PCIe-based topology.
+
+\subsection{How I will measure success}
+I will report:
+\begin{itemize}
+  \item \textbf{Latency speedup} \(S(p)=T_{1}/T_{p}\) vs my reproduced \textbf{1-GPU FIDESlib baseline} on the same cluster node.
+  \item \textbf{Scaling efficiency} \(E(p)=S(p)/p\) for \(p\in\{2,4,8\}\) GPUs (when allocation permits).
+  \item \textbf{Throughput} (ops/sec) for batched workloads (bootstrapping batches and MatMul tile batches).
+  \item \textbf{Phase breakdowns:} time in NTT/INTT, key-switch/rotations, base conversion, and communication; plus achieved NCCL bandwidth and observed overlap between communication and compute.
+  \item \textbf{Correctness:} decrypt-and-compare checks against OpenFHE for selected test vectors; CKKS numeric error tracking before/after bootstrapping.
+\end{itemize}
+For comparison against the literature, I will include a table that places my reproduced 1-GPU numbers next to the published RTX 4090 reference results from FIDESlib (Table V--VII) and clearly separates \emph{absolute time} (hardware-dependent) from \emph{multi-GPU scaling} (the focus of this project).
+
+% ==========================================================
+\section{Deliverables}
+\begin{itemize}
+  \item \textbf{Code:} a multi-GPU FIDESlib fork with NCCL-backed communication paths for Mode A.
+  % (and Mode B sharding experiments where feasible).
+  \item \textbf{Instrumentation + artifacts:} NVTX-instrumented timelines (Nsight Systems), call-stack/timeline screenshots, and exported computation DAGs (algorithm-level + runtime-level) in \texttt{.dot} and \texttt{.json}.
+  \item \textbf{Benchmark harness:} scripts/configs to reproduce all experiments (parameters, GPU count, fixed seeds, and topology logging).
+  \item \textbf{Final report:} implementation description, scaling results, phase breakdowns, and a bottleneck analysis grounded in measured communication costs on the target node topology.
+\end{itemize}
+
+% ==========================================================
+\section{Planned Experiments}
+\subsection{Compute environment}
+I will run experiments on the campus Slurm cluster using partition \texttt{t4\_ai} under account/QoS \texttt{comx29}. The \texttt{t4\_ai} partition is configured with nodes \texttt{ai01--ai08} and a time limit of 2 hours. Each node is configured with Tesla T4 GPUs; in an interactive allocation on \texttt{ai08} I verified CUDA access and NCCL loading, and observed multiple T4 devices visible via \texttt{nvidia-smi}. The GPU topology is PCIe-based (no NVLink), and an InfiniBand NIC (\texttt{mlx5\_0}) is present on the node.
+
+\subsection{Experiment suite}
+\begin{enumerate}
+  \item \textbf{Microbenchmarks (kernel-level):} NTT/INTT, pointwise mul/add, and key switching/rotation subroutines on 1 GPU; then repeat under Mode A batching.
+  % and Mode B sharding to isolate communication overheads.
+  \item \textbf{MatMul scaling:} implement a MatMul-style workload decomposition using CKKS primitives; run Mode A (tile/batch parallel) on 1/2/4/(8) GPUs; compare NCCL collectives vs P2P baselines for reductions.
+  \item \textbf{Bootstrapping scaling:} run batched bootstrapping (Mode A) across GPUs and report throughput;
+  % examine stage-level sharding experiments (Mode B) for limb-separable stages and quantify communication-limited steps.
+  \item \textbf{End-to-end mini workload:} encrypted linear layer (MatMul + add) with periodic bootstrapping; report throughput/latency, phase breakdown, and correctness drift.
+\end{enumerate}
+Problem sizes will use CKKS parameter sets supported by FIDESlib benchmarks (e.g., \(N=2^{14}\) to \(2^{16}\), varying modulus chain lengths) to maintain correctness parity and comparability.\cite{fides-paper}
+
+% ==========================================================
+\section{Detailed 4-week Plan}
+\textbf{Week 1: Baseline + instrumentation.} Build FIDESlib and OpenFHE; reproduce 1-GPU baselines for MatMul-related primitives and bootstrapping; add NVTX ranges and timing hooks; implement correctness checks (decrypt-and-compare); capture initial Nsight Systems traces; implement a first-pass algorithm DAG exporter.
+
+\textbf{Week 2: Multi-GPU runtime skeleton (NCCL-first).} Implement device discovery, stream/event structure, and NCCL collectives required for Mode A; validate correctness under multi-GPU scheduling; measure NCCL bandwidth/latency on 1/2/4 GPUs; attempt NVSHMEM user-space build and document the outcome.
+
+\textbf{Week 3: MatMul multi-GPU.} Implement Mode A MatMul-style decomposition (tile/batch parallel) with NCCL reductions; generate scaling curves and phase breakdowns; export runtime DAGs that include kernel launches + communication events.
+
+\textbf{Week 4: Bootstrapping multi-GPU + final evaluation.} Implement and evaluate batched bootstrapping across GPUs (Mode A);
+% run Mode B stage-level sharding experiments for limb-separable kernels within bootstrapping; finalize all experiments;
+produce dense tables/figures; write and polish the final report.
+
+% ==========================================================
+\section{Final Project Report}
+The final report will include: implementation description, profiling evidence (call stacks/timelines), computation DAG artifacts, scaling results (speedup/efficiency/throughput), and a bottleneck analysis explaining observed limits on PCIe-based multi-GPU T4 nodes.
+
+% ==========================================================
+{\footnotesize
+\begin{thebibliography}{9}\setlength{\itemsep}{1pt}
+
+\bibitem{fides-paper}
+C.~Agull{\'o}-Domingo et al., ``FIDESlib: A Fully-Fledged Open-Source FHE Library for Efficient CKKS on GPUs,'' arXiv:2507.04775 (2025).
+\href{https://arxiv.org/abs/2507.04775}{https://arxiv.org/abs/2507.04775}
+
+\bibitem{fides-github}
+CAPS-UMU, ``FIDESlib GitHub Repository (MIT License),'' \href{https://github.com/CAPS-UMU/FIDESlib}{https://github.com/CAPS-UMU/FIDESlib}
+
+\end{thebibliography}
+}
+
+\end{document}

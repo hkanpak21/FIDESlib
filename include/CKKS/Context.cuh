@@ -9,10 +9,13 @@
 #include "LimbUtils.cuh"
 #include "Parameters.cuh"
 #include "RNSPoly.cuh"
+#include "KeySwitchingKey.cuh"
 
 #include <array>
 #include <cassert>
 #include <iostream>
+#include <map>
+#include <optional>
 
 namespace FIDESlib::CKKS {
 
@@ -98,13 +101,18 @@ class Context {
     std::vector<double>& GetCoeffsChebyshev();
     int GetDoubleAngleIts();
     void AddBootPrecomputation(int slots, BootstrapPrecomputation&& precomp) const;
-    static BootstrapPrecomputation& GetBootPrecomputation(int slots);
+    BootstrapPrecomputation& GetBootPrecomputation(int slots) const;
     void AddRotationKey(int index, KeySwitchingKey&& ksk);
     KeySwitchingKey& GetRotationKey(int index);
     bool HasRotationKey(int index);
-    static void AddEvalKey(KeySwitchingKey&& ksk);
-    static KeySwitchingKey& GetEvalKey();
+    void AddEvalKey(KeySwitchingKey&& ksk);
+    KeySwitchingKey& GetEvalKey();
     int GetBootK();
+
+    // Per-context key storage (replaces static globals for multi-GPU support)
+    mutable std::map<int, BootstrapPrecomputation> boot_precomps_;
+    mutable std::map<int, KeySwitchingKey> rot_keys_;
+    mutable std::optional<KeySwitchingKey> eval_key_;
     int GetBootCorrectionFactor();
     static RESCALE_TECHNIQUE translateRescalingTechnique(lbcrypto::ScalingTechnique technique);
 };

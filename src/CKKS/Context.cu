@@ -4,6 +4,7 @@
 #include "CKKS/Context.cuh"
 
 #include <source_location>
+#include <stdexcept>
 #include "CKKS/BootstrapPrecomputation.cuh"
 #include "CKKS/KeySwitchingKey.cuh"
 
@@ -429,54 +430,57 @@ int Context::GetBootK() {
     return param.raw ? param.raw->bootK : 1.0;
 }
 
-std::map<int, BootstrapPrecomputation> boot_precomps;
+// Per-context key storage (instance members instead of static globals for multi-GPU support)
 
-BootstrapPrecomputation& Context::GetBootPrecomputation(int slots) {
-    if (!boot_precomps.contains(slots))
-        assert("No precomputation." == nullptr);
-    return boot_precomps[slots];
+BootstrapPrecomputation& Context::GetBootPrecomputation(int slots) const {
+    if (!boot_precomps_.contains(slots))
+        throw std::runtime_error("No bootstrap precomputation for slots: " + std::to_string(slots));
+    return boot_precomps_.at(slots);
 }
-
-std::map<int, KeySwitchingKey> rot_keys;
 
 KeySwitchingKey& Context::GetRotationKey(int index) {
     //index = index % (cc.N / 2);
     if (index < 0)
         index += this->N / 2;
-    return rot_keys.at(index);
+    return rot_keys_.at(index);
 }
+
 void Context::AddRotationKey(int index, KeySwitchingKey&& ksk) {
     //index = index % (cc.N / 2);
     if (index < 0)
         index += this->N / 2;
-    rot_keys.emplace(index, std::move(ksk));
+    rot_keys_.emplace(index, std::move(ksk));
 }
+
 bool Context::HasRotationKey(int index) {
     //index = index % (cc.N / 2);
     if (index < 0)
         index += this->N / 2;
-    return rot_keys.contains(index);
+    return rot_keys_.contains(index);
 }
-
-std::optional<KeySwitchingKey> eval_key;
 
 void Context::AddEvalKey(KeySwitchingKey&& ksk) {
-    eval_key.emplace(std::move(ksk));
+    eval_key_.emplace(std::move(ksk));
 }
+
 KeySwitchingKey& Context::GetEvalKey() {
-    return eval_key.value();
+    if (!eval_key_.has_value()) {
+        throw std::runtime_error("Eval key not set for this context");
+    }
+    return eval_key_.value();
 }
+
 Context::~Context() {
-    eval_key.reset();
-    rot_keys.clear();
-    boot_precomps.clear();
+    eval_key_.reset();
+    rot_keys_.clear();
+    boot_precomps_.clear();
 }
 
 void Context::AddBootPrecomputation(int slots, BootstrapPrecomputation&& precomp) const {
     {
         std::cout << "Adding bootstrap precomputation to GPU for " << slots << " slots.\n"
-                  << "Rotation keys loaded: " << rot_keys.size() << " ~ "
-                  << 2 * ((long long)rot_keys.size() * dnum * (L + K + 1) * N * 8 / (1 << 20)) << "MB\n"
+                  << "Rotation keys loaded: " << rot_keys_.size() << " ~ "
+                  << 2 * ((long long)rot_keys_.size() * dnum * (L + K + 1) * N * 8 / (1 << 20)) << "MB\n"
                   << "Plaintexts loaded: "
                   << (precomp.CtS.size() == 0 ? (precomp.LT.A.size() + precomp.LT.invA.size())
                                               : (precomp.StC.size() * precomp.StC.at(0).A.size() +
@@ -492,7 +496,7 @@ void Context::AddBootPrecomputation(int slots, BootstrapPrecomputation&& precomp
                   << "MB\n";
     }
 
-    boot_precomps.emplace(slots, std::move(precomp));
+    boot_precomps_.emplace(slots, std::move(precomp));
 }
 
 Context::RESCALE_TECHNIQUE Context::translateRescalingTechnique(lbcrypto::ScalingTechnique technique) {

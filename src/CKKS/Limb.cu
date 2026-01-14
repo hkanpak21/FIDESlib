@@ -342,9 +342,12 @@ void Limb<T>::NTT() {
                                     gridDim, blockDim, args, bytes, stream.ptr);
         //CudaCheckErrorModNoSync;
     } else if constexpr (1) {
-        static std::map<int, cudaGraphExec_t> exec;
+        static std::map<std::pair<int,int>, cudaGraphExec_t> exec;
+        int current_device;
+        cudaGetDevice(&current_device);
+        auto graph_key = std::make_pair(current_device, primeid);
 
-        run_in_graph<false>(exec[primeid], stream, [&]() {
+        run_in_graph<false>(exec[graph_key], stream, [&]() {
             assert(primeid >= 0);
             constexpr int M = sizeof(T) == 8 ? 4 : 8;
 
@@ -475,7 +478,10 @@ void Limb<uint64_t>::NTT_multpt_fused(const LimbImpl& _l, const LimbImpl& _pt) {
     assert(_l.index() == U64);
     assert(_pt.index() == U64);
 
-    static std::map<int, cudaGraphExec_t> exec;
+    static std::map<std::pair<int,int>, cudaGraphExec_t> exec;
+    int current_device;
+    cudaGetDevice(&current_device);
+    auto graph_key = std::make_pair(current_device, primeid);
 
     //run_in_graph<false>(exec[primeid], stream, [&]()
     {

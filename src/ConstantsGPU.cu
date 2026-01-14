@@ -5,6 +5,7 @@
 #include <bit>
 #include <cassert>
 #include <execution>
+#include <set>
 #include "ConstantsGPU.cuh"
 #include "CudaUtils.cuh"
 #include "Math.cuh"
@@ -13,6 +14,11 @@
 
 namespace FIDESlib {
 
+// Track which GPUs have been initialized (for multi-context support)
+static std::set<int> initialized_gpus;
+static int initialized_N = 0;
+static int initialized_L = 0;
+static int initialized_K = 0;
 __constant__ Constants constants;
 namespace Globals {
 __device__ void* psi[MAXP];
@@ -147,7 +153,42 @@ void SetupConstants(const std::vector<PrimeRecord>& q, const std::vector<std::ve
                     const Scheme& parameters) {
     CudaCheckErrorMod;
 
-    cleanUpPrevious();
+    // Check if parameters are compatible with existing initialization
+    bool compatible = (initialized_N == N && initialized_L == (int)q.size() && initialized_K == (int)p.size());
+    
+    // Find which GPUs need initialization
+    std::vector<int> gpus_to_init;
+    for (int id : GPUid) {
+        if (initialized_gpus.find(id) == initialized_gpus.end()) {
+            gpus_to_init.push_back(id);
+        }
+    }
+    
+    // If compatible and all GPUs already initialized, just copy constants
+    if (compatible && gpus_to_init.empty()) {
+        for (int id : GPUid) {
+            cudaSetDevice(id);
+            cudaMemcpyToSymbol(constants, &host_constants, sizeof(Constants), 0, cudaMemcpyHostToDevice);
+        }
+        return;
+    }
+    
+    // If not compatible with previous setup, clean up and start fresh
+    if (!compatible && !initialized_gpus.empty()) {
+        cleanUpPrevious();
+        initialized_gpus.clear();
+        gpus_to_init = std::vector<int>(GPUid.begin(), GPUid.end());
+    }
+    
+    // Only clean up if this is the first initialization
+    if (initialized_gpus.empty()) {
+        cleanUpPrevious();
+    }
+    
+    // Track what we're initializing
+    initialized_N = N;
+    initialized_L = q.size();
+    initialized_K = p.size();
 
     for (int id : GPUid) {
         cudaSetDevice(id);
@@ -347,53 +388,57 @@ void SetupConstants(const std::vector<PrimeRecord>& q, const std::vector<std::ve
         }
     }
 
-    for (size_t i = 0; i < GPUid.size(); ++i) {
-        cudaSetDevice(0/*GPUid.at(i)*/);
+    // Use GPU ID instead of loop index for array indexing (critical for multi-GPU)
+    // Only initialize GPUs that haven't been initialized yet
+    for (int gpu_id : gpus_to_init) {
+        cudaSetDevice(gpu_id);
 CudaCheckErrorMod;
         for (int j = 0; j < hC_.L + hC_.K; ++j) {
             int bytes = hC_.N * ((HISU64(j)) ? sizeof(uint64_t) : sizeof(uint32_t));
 
-            cudaMalloc(&(hG_.psi_ptr[i][j]), bytes);
-            cudaMalloc(&(hG_.inv_psi_ptr[i][j]), bytes);
-            cudaMalloc(&(hG_.psi_no_ptr[i][j]), 2 * bytes);
-            cudaMalloc(&(hG_.inv_psi_no_ptr[i][j]), 2 * bytes);
-            cudaMalloc(&(hG_.psi_middle_scale_ptr[i][j]), bytes);
-            cudaMalloc(&(hG_.inv_psi_middle_scale_ptr[i][j]), bytes);
-            cudaMalloc(&(hG_.psi_barrett_ptr[i][j]), bytes);
-            cudaMalloc(&(hG_.inv_psi_barrett_ptr[i][j]), bytes);
+            cudaMalloc(&(hG_.psi_ptr[gpu_id][j]), bytes);
+            cudaMalloc(&(hG_.inv_psi_ptr[gpu_id][j]), bytes);
+            cudaMalloc(&(hG_.psi_no_ptr[gpu_id][j]), 2 * bytes);
+            cudaMalloc(&(hG_.inv_psi_no_ptr[gpu_id][j]), 2 * bytes);
+            cudaMalloc(&(hG_.psi_middle_scale_ptr[gpu_id][j]), bytes);
+            cudaMalloc(&(hG_.inv_psi_middle_scale_ptr[gpu_id][j]), bytes);
+            cudaMalloc(&(hG_.psi_barrett_ptr[gpu_id][j]), bytes);
+            cudaMalloc(&(hG_.inv_psi_barrett_ptr[gpu_id][j]), bytes);
             CudaCheckErrorMod;
-            cudaMemcpy(hG_.psi_ptr[i][j], hG_.psi[j], bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(hG_.inv_psi_ptr[i][j], hG_.inv_psi[j], bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(hG_.psi_no_ptr[i][j], hG_.psi_no[j], 2 * bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(hG_.inv_psi_no_ptr[i][j], hG_.inv_psi_no[j], 2 * bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(hG_.psi_middle_scale_ptr[i][j], hG_.psi_middle_scale[j], bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(hG_.inv_psi_middle_scale_ptr[i][j], hG_.inv_psi_middle_scale[j], bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(hG_.psi_barrett_ptr[i][j], hG_.psi_shoup[j], bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(hG_.inv_psi_barrett_ptr[i][j], hG_.inv_psi_shoup[j], bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.psi_ptr[gpu_id][j], hG_.psi[j], bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.inv_psi_ptr[gpu_id][j], hG_.inv_psi[j], bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.psi_no_ptr[gpu_id][j], hG_.psi_no[j], 2 * bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.inv_psi_no_ptr[gpu_id][j], hG_.inv_psi_no[j], 2 * bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.psi_middle_scale_ptr[gpu_id][j], hG_.psi_middle_scale[j], bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.inv_psi_middle_scale_ptr[gpu_id][j], hG_.inv_psi_middle_scale[j], bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.psi_barrett_ptr[gpu_id][j], hG_.psi_shoup[j], bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.inv_psi_barrett_ptr[gpu_id][j], hG_.inv_psi_shoup[j], bytes, cudaMemcpyHostToDevice);
             CudaCheckErrorMod;
         }
 
-        cudaMemcpyToSymbol(Globals::psi, hG_.psi_ptr[i], sizeof(Globals::psi), 0, cudaMemcpyHostToDevice);
+        cudaMemcpyToSymbol(Globals::psi, hG_.psi_ptr[gpu_id], sizeof(Globals::psi), 0, cudaMemcpyHostToDevice);
 CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::psi_no, hG_.psi_no_ptr[i], sizeof(hG_.psi_no_ptr[i]), 0, cudaMemcpyHostToDevice);
+        cudaMemcpyToSymbol(G_::psi_no, hG_.psi_no_ptr[gpu_id], sizeof(hG_.psi_no_ptr[gpu_id]), 0, cudaMemcpyHostToDevice);
 CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::psi_middle_scale, hG_.psi_middle_scale_ptr[i], sizeof(hG_.psi_middle_scale_ptr[i]), 0,
+        cudaMemcpyToSymbol(G_::psi_middle_scale, hG_.psi_middle_scale_ptr[gpu_id], sizeof(hG_.psi_middle_scale_ptr[gpu_id]), 0,
                            cudaMemcpyHostToDevice);
 CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::inv_psi, hG_.inv_psi_ptr[i], sizeof(hG_.inv_psi_ptr[i]), 0, cudaMemcpyHostToDevice);
+        cudaMemcpyToSymbol(G_::inv_psi, hG_.inv_psi_ptr[gpu_id], sizeof(hG_.inv_psi_ptr[gpu_id]), 0, cudaMemcpyHostToDevice);
 CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::inv_psi_no, hG_.inv_psi_no_ptr[i], sizeof(hG_.inv_psi_no_ptr[i]), 0,
+        cudaMemcpyToSymbol(G_::inv_psi_no, hG_.inv_psi_no_ptr[gpu_id], sizeof(hG_.inv_psi_no_ptr[gpu_id]), 0,
                            cudaMemcpyHostToDevice);
 CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::inv_psi_middle_scale, hG_.inv_psi_middle_scale_ptr[i],
-                           sizeof(hG_.inv_psi_middle_scale_ptr[i]), 0, cudaMemcpyHostToDevice);
+        cudaMemcpyToSymbol(G_::inv_psi_middle_scale, hG_.inv_psi_middle_scale_ptr[gpu_id],
+                           sizeof(hG_.inv_psi_middle_scale_ptr[gpu_id]), 0, cudaMemcpyHostToDevice);
 CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::psi_shoup, hG_.psi_barrett_ptr[i], sizeof(hG_.psi_barrett_ptr[i]), 0,
+        cudaMemcpyToSymbol(G_::psi_shoup, hG_.psi_barrett_ptr[gpu_id], sizeof(hG_.psi_barrett_ptr[gpu_id]), 0,
                            cudaMemcpyHostToDevice);
 CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::inv_psi_shoup, hG_.inv_psi_barrett_ptr[i], sizeof(hG_.inv_psi_barrett_ptr[i]), 0,
+        cudaMemcpyToSymbol(G_::inv_psi_shoup, hG_.inv_psi_barrett_ptr[gpu_id], sizeof(hG_.inv_psi_barrett_ptr[gpu_id]), 0,
                            cudaMemcpyHostToDevice);
 CudaCheckErrorMod;
+        // Mark this GPU as initialized
+        initialized_gpus.insert(gpu_id);
     }
 
     {

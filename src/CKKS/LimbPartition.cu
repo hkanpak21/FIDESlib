@@ -339,8 +339,11 @@ void LimbPartition::NTT(int batch, NTT_fusion_fields fields, const int limbsize)
         }
         CudaCheckErrorModNoSync;
 
-        static std::map<int, cudaGraphExec_t> execs;
-        cudaGraphExec_t& exec = execs[limb.size()];
+        static std::map<std::pair<int,int>, cudaGraphExec_t> execs;
+        int current_device;
+        cudaGetDevice(&current_device);
+        auto graph_key = std::make_pair(current_device, (int)limb.size());
+        cudaGraphExec_t& exec = execs[graph_key];
 
         if (!exec) {
             cudaGraphInstantiateWithFlags(&exec, g, 0);
@@ -547,12 +550,15 @@ void LimbPartition::multPt(const LimbPartition& p) {
     cudaSetDevice(device);
 
     constexpr bool capture = false;
-    static std::map<int, cudaGraphExec_t> exec_map;
+    static std::map<std::pair<int,int>, cudaGraphExec_t> exec_map;
+    int current_device;
+    cudaGetDevice(&current_device);
+    auto graph_key = std::make_pair(current_device, (int)limb.size());
 
     {
         LimbImpl& top = limb.back();
 
-        cudaGraphExec_t& exec = exec_map[limb.size()];
+        cudaGraphExec_t& exec = exec_map[graph_key];
 
         run_in_graph<capture>(exec, s, [&]() {
             STREAM(top).wait(s);
