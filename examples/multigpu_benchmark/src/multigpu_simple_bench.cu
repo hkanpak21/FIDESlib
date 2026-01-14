@@ -11,6 +11,7 @@
 #include <chrono>
 #include <thread>
 #include <iomanip>
+#include <algorithm>
 #include <cuda_runtime.h>
 
 #include <openfhe.h>
@@ -65,18 +66,80 @@ void printGPUInfo() {
         cudaGetDeviceProperties(&prop, i);
         std::cout << "  GPU " << i << ": " << prop.name 
                   << " (Compute " << prop.major << "." << prop.minor << ")"
+                  << " - SMs: " << prop.multiProcessorCount
+                  << ", " << (prop.totalGlobalMem / (1024*1024*1024)) << " GB"
                   << std::endl;
     }
     std::cout << std::endl;
 }
 
+// CUDA Event Timer for precise GPU timing
+class CudaTimer {
+public:
+    CudaTimer(int device = 0) : device_(device) {
+        cudaSetDevice(device_);
+        cudaEventCreate(&start_);
+        cudaEventCreate(&stop_);
+    }
+    ~CudaTimer() {
+        cudaEventDestroy(start_);
+        cudaEventDestroy(stop_);
+    }
+    void start(cudaStream_t stream = 0) {
+        cudaSetDevice(device_);
+        cudaEventRecord(start_, stream);
+    }
+    void stop(cudaStream_t stream = 0) {
+        cudaSetDevice(device_);
+        cudaEventRecord(stop_, stream);
+    }
+    float elapsedMs() {
+        cudaSetDevice(device_);
+        cudaEventSynchronize(stop_);
+        float ms;
+        cudaEventElapsedTime(&ms, start_, stop_);
+        return ms;
+    }
+private:
+    int device_;
+    cudaEvent_t start_, stop_;
+};
+
+// Performance breakdown structure
+struct PerfBreakdown {
+    double contextSetup = 0;
+    double keyGen = 0;
+    double keyLoad = 0;
+    double encryption = 0;
+    double h2dTransfer = 0;
+    double gpuCompute = 0;
+    
+    void print(const std::string& label) const {
+        std::cout << "\n  " << label << " - Performance Breakdown:" << std::endl;
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << "    Context Setup:   " << std::setw(10) << contextSetup << " ms" << std::endl;
+        std::cout << "    Key Generation:  " << std::setw(10) << keyGen << " ms" << std::endl;
+        std::cout << "    Key Loading:     " << std::setw(10) << keyLoad << " ms" << std::endl;
+        std::cout << "    CPU Encryption:  " << std::setw(10) << encryption << " ms" << std::endl;
+        std::cout << "    H2D Transfer:    " << std::setw(10) << h2dTransfer << " ms" << std::endl;
+        std::cout << "    GPU Compute:     " << std::setw(10) << gpuCompute << " ms  <-- KEY METRIC" << std::endl;
+        double total = contextSetup + keyGen + keyLoad + encryption + h2dTransfer + gpuCompute;
+        std::cout << "    ----------------------------------" << std::endl;
+        std::cout << "    Total:           " << std::setw(10) << total << " ms" << std::endl;
+        std::cout << "    GPU % of Total:  " << std::setw(10) << (gpuCompute / total * 100) << " %" << std::endl;
+    }
+};
+
 // ============================================================================
 // Single GPU: Run N operations sequentially on one GPU
 // ============================================================================
-double benchSingleGPU(int numOps, int numIters, int logN, int L) {
+double benchSingleGPU(int numOps, int numIters, int logN, int L, PerfBreakdown* breakdown = nullptr) {
     std::cout << "\n>>> Single GPU (GPU 0): " << numOps << " ops x " << numIters << " iters <<<" << std::endl;
     
-    // Setup OpenFHE
+    Timer phaseTimer;
+    
+    // Phase 1: Context Setup
+    phaseTimer.start();
     lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS> params;
     params.SetSecurityLevel(lbcrypto::HEStd_NotSet);
     params.SetMultiplicativeDepth(L);
@@ -90,60 +153,81 @@ double benchSingleGPU(int numOps, int numIters, int logN, int L) {
     cc->Enable(lbcrypto::PKE);
     cc->Enable(lbcrypto::KEYSWITCH);
     cc->Enable(lbcrypto::LEVELEDSHE);
+    phaseTimer.stop();
+    if (breakdown) breakdown->contextSetup = phaseTimer.elapsedMs();
     
+    // Phase 2: Key Generation
+    phaseTimer.start();
     auto keys = cc->KeyGen();
     cc->EvalMultKeyGen(keys.secretKey);
+    phaseTimer.stop();
+    if (breakdown) breakdown->keyGen = phaseTimer.elapsedMs();
     
-    // Setup FIDESlib
+    // Phase 3: GPU Context + Key Loading
+    phaseTimer.start();
     cudaSetDevice(0);
     FIDESlib::CKKS::Parameters fidesParams{.logN = logN, .L = L, .dnum = 1, .primes = p64, .Sprimes = sp64};
     auto raw_params = FIDESlib::CKKS::GetRawParams(cc);
     auto p = fidesParams.adaptTo(raw_params);
     FIDESlib::CKKS::Context gpu_cc(p, {0});
     
-    // Load eval key
     auto eval_key_raw = FIDESlib::CKKS::GetEvalKeySwitchKey(keys);
     FIDESlib::CKKS::KeySwitchingKey eval_key_gpu(gpu_cc);
     eval_key_gpu.Initialize(gpu_cc, eval_key_raw);
     gpu_cc.AddEvalKey(std::move(eval_key_gpu));
+    cudaDeviceSynchronize();
+    phaseTimer.stop();
+    if (breakdown) breakdown->keyLoad = phaseTimer.elapsedMs();
     
-    // Create ciphertexts
+    // Phase 4: CPU Encryption
+    phaseTimer.start();
     int slots = 1 << (logN - 1);
     std::vector<double> test_data(slots, 1.5);
     auto pt = cc->MakeCKKSPackedPlaintext(test_data);
     
+    std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> cpu_cts;
+    for (int i = 0; i < numOps; ++i) {
+        cpu_cts.push_back(cc->Encrypt(keys.publicKey, pt));
+    }
+    phaseTimer.stop();
+    if (breakdown) breakdown->encryption = phaseTimer.elapsedMs();
+    
+    // Phase 5: H2D Transfer
+    phaseTimer.start();
     std::vector<std::unique_ptr<FIDESlib::CKKS::Ciphertext>> gpu_cts;
     for (int i = 0; i < numOps; ++i) {
-        auto ct = cc->Encrypt(keys.publicKey, pt);
-        auto ct_raw = FIDESlib::CKKS::GetRawCipherText(cc, ct);
+        auto ct_raw = FIDESlib::CKKS::GetRawCipherText(cc, cpu_cts[i]);
         gpu_cts.push_back(std::make_unique<FIDESlib::CKKS::Ciphertext>(gpu_cc, ct_raw));
     }
-    
     cudaDeviceSynchronize();
+    phaseTimer.stop();
+    if (breakdown) breakdown->h2dTransfer = phaseTimer.elapsedMs();
     
-    // WARMUP: Run one operation to compile CUDA graphs
+    // WARMUP
     std::cout << "  Warming up..." << std::endl;
     gpu_cts[0]->mult(*gpu_cts[0], gpu_cc.GetEvalKey());
     cudaDeviceSynchronize();
     
-    // Benchmark - pure GPU compute
+    // Phase 6: GPU Compute (THE KEY METRIC)
     std::cout << "  Running benchmark..." << std::endl;
-    Timer timer;
-    timer.start();
+    CudaTimer cudaTimer(0);
+    cudaTimer.start();
     
     for (int iter = 0; iter < numIters; ++iter) {
         for (int i = 0; i < numOps; ++i) {
-            gpu_cts[i]->mult(*gpu_cts[i], gpu_cc.GetEvalKey());  // Self-mult (square)
+            gpu_cts[i]->mult(*gpu_cts[i], gpu_cc.GetEvalKey());
         }
     }
     
     cudaDeviceSynchronize();
-    timer.stop();
+    cudaTimer.stop();
     
-    double totalMs = timer.elapsedMs();
+    double totalMs = cudaTimer.elapsedMs();
+    if (breakdown) breakdown->gpuCompute = totalMs;
+    
     double opsPerSec = (numOps * numIters * 1000.0) / totalMs;
     
-    std::cout << "  Total time: " << totalMs << " ms" << std::endl;
+    std::cout << "  GPU Compute time: " << totalMs << " ms" << std::endl;
     std::cout << "  Throughput: " << opsPerSec << " ops/sec" << std::endl;
     
     cc->ClearEvalMultKeys();
@@ -234,36 +318,48 @@ double benchMultiGPU(int numOps, int numIters, int logN, int L, int numGPUs) {
         cudaDeviceSynchronize();
     }
     
-    // Benchmark - parallel GPU compute
-    Timer timer;
+    // Benchmark - parallel GPU compute using CUDA event timers
     std::vector<double> perGpuTime(numGPUs);
     
     std::cout << "  Running parallel benchmark..." << std::endl;
-    timer.start();
+    
+    // Wall clock for total time
+    auto wallStart = std::chrono::high_resolution_clock::now();
     
     std::vector<std::thread> threads;
     for (int g = 0; g < numGPUs; ++g) {
         threads.emplace_back([&, g]() {
             cudaSetDevice(g);
-            Timer localTimer;
-            localTimer.start();
+            
+            // Use CUDA events for accurate GPU timing
+            cudaEvent_t start, stop;
+            cudaEventCreate(&start);
+            cudaEventCreate(&stop);
+            
+            cudaEventRecord(start);
             
             for (int iter = 0; iter < numIters; ++iter) {
                 for (auto& ct : gpu_cts[g]) {
-                    ct->mult(*ct, gpu_contexts[g]->GetEvalKey());  // Self-mult
+                    ct->mult(*ct, gpu_contexts[g]->GetEvalKey());
                 }
             }
             
-            cudaDeviceSynchronize();
-            localTimer.stop();
-            perGpuTime[g] = localTimer.elapsedMs();
+            cudaEventRecord(stop);
+            cudaEventSynchronize(stop);
+            
+            float ms;
+            cudaEventElapsedTime(&ms, start, stop);
+            perGpuTime[g] = ms;
+            
+            cudaEventDestroy(start);
+            cudaEventDestroy(stop);
         });
     }
     
     for (auto& t : threads) t.join();
     
-    timer.stop();
-    double totalMs = timer.elapsedMs();
+    auto wallEnd = std::chrono::high_resolution_clock::now();
+    double totalMs = std::chrono::duration<double, std::milli>(wallEnd - wallStart).count();
     double opsPerSec = (numOps * numIters * 1000.0) / totalMs;
     
     std::cout << "  Total time (wall): " << totalMs << " ms" << std::endl;
@@ -272,6 +368,19 @@ double benchMultiGPU(int numOps, int numIters, int logN, int L, int numGPUs) {
                   << gpu_cts[g].size() << " ops)" << std::endl;
     }
     std::cout << "  Throughput: " << opsPerSec << " ops/sec" << std::endl;
+    
+    // Print load balance analysis
+    double maxTime = *std::max_element(perGpuTime.begin(), perGpuTime.end());
+    double minTime = *std::min_element(perGpuTime.begin(), perGpuTime.end());
+    double avgTime = 0;
+    for (double t : perGpuTime) avgTime += t;
+    avgTime /= numGPUs;
+    
+    std::cout << "\n  Load Balance Analysis:" << std::endl;
+    std::cout << "    Max GPU time:   " << std::fixed << std::setprecision(2) << maxTime << " ms" << std::endl;
+    std::cout << "    Min GPU time:   " << minTime << " ms" << std::endl;
+    std::cout << "    Avg GPU time:   " << avgTime << " ms" << std::endl;
+    std::cout << "    Imbalance:      " << ((maxTime - minTime) / avgTime * 100.0) << "%" << std::endl;
     
     cc->ClearEvalMultKeys();
     return totalMs;
@@ -304,8 +413,9 @@ int main(int argc, char* argv[]) {
               << ", ops=" << numOps << ", iters=" << numIters 
               << ", GPUs=" << numGPUs << std::endl;
     
-    // Run benchmarks
-    double singleTime = benchSingleGPU(numOps, numIters, logN, L);
+    // Run benchmarks with performance breakdown
+    PerfBreakdown singleBreakdown;
+    double singleTime = benchSingleGPU(numOps, numIters, logN, L, &singleBreakdown);
     double multiTime = benchMultiGPU(numOps, numIters, logN, L, numGPUs);
     
     // Results
@@ -317,16 +427,65 @@ int main(int argc, char* argv[]) {
     double efficiency = (speedup / numGPUs) * 100.0;
     
     std::cout << std::fixed << std::setprecision(2);
-    std::cout << "  Single GPU time:      " << singleTime << " ms" << std::endl;
-    std::cout << "  Multi-GPU time:       " << multiTime << " ms" << std::endl;
-    std::cout << "  Speedup:              " << speedup << "x" << std::endl;
-    std::cout << "  Parallel Efficiency:  " << efficiency << "%" << std::endl;
+    std::cout << "\n  GPU Compute Time (Key Metric):" << std::endl;
+    std::cout << "    Single GPU:    " << singleTime << " ms" << std::endl;
+    std::cout << "    Multi-GPU:     " << multiTime << " ms" << std::endl;
+    std::cout << "    Speedup:       " << speedup << "x" << std::endl;
+    std::cout << "    Efficiency:    " << efficiency << "%" << std::endl;
     
     double singleThroughput = (numOps * numIters * 1000.0) / singleTime;
     double multiThroughput = (numOps * numIters * 1000.0) / multiTime;
     
-    std::cout << "\n  Single GPU Throughput: " << singleThroughput << " ops/sec" << std::endl;
-    std::cout << "  Multi-GPU Throughput:  " << multiThroughput << " ops/sec" << std::endl;
+    std::cout << "\n  Throughput:" << std::endl;
+    std::cout << "    Single GPU:    " << singleThroughput << " HE-mults/sec" << std::endl;
+    std::cout << "    Multi-GPU:     " << multiThroughput << " HE-mults/sec" << std::endl;
+    
+    // Print performance breakdown
+    singleBreakdown.print("Single GPU");
+    
+    // Latency bottleneck analysis
+    std::cout << "\n╔═══════════════════════════════════════════════════════════════╗" << std::endl;
+    std::cout << "║               LATENCY BOTTLENECK ANALYSIS                     ║" << std::endl;
+    std::cout << "╚═══════════════════════════════════════════════════════════════╝" << std::endl;
+    
+    double totalSingle = singleBreakdown.contextSetup + singleBreakdown.keyGen + 
+                         singleBreakdown.keyLoad + singleBreakdown.encryption +
+                         singleBreakdown.h2dTransfer + singleBreakdown.gpuCompute;
+    
+    struct Phase { const char* name; double time; };
+    std::vector<Phase> phases = {
+        {"CPU Encryption", singleBreakdown.encryption},
+        {"Key Generation", singleBreakdown.keyGen},
+        {"GPU Compute", singleBreakdown.gpuCompute},
+        {"Context Setup", singleBreakdown.contextSetup},
+        {"Key Loading", singleBreakdown.keyLoad},
+        {"H2D Transfer", singleBreakdown.h2dTransfer}
+    };
+    std::sort(phases.begin(), phases.end(), [](const Phase& a, const Phase& b) {
+        return a.time > b.time;
+    });
+    
+    std::cout << "\n  Top Latency Contributors:" << std::endl;
+    for (size_t i = 0; i < phases.size(); ++i) {
+        double pct = (phases[i].time / totalSingle) * 100.0;
+        int bars = (int)(pct / 2);
+        std::cout << "    " << (i+1) << ". " << std::left << std::setw(16) << phases[i].name
+                  << " [";
+        for (int b = 0; b < 50; ++b) std::cout << (b < bars ? "=" : " ");
+        std::cout << "] " << std::right << std::setw(5) << pct << "% (" 
+                  << std::setw(8) << phases[i].time << " ms)" << std::endl;
+    }
+    
+    std::cout << "\n  Recommendations:" << std::endl;
+    if (singleBreakdown.encryption > singleBreakdown.gpuCompute * 2) {
+        std::cout << "    → CPU Encryption dominates. For real workloads:" << std::endl;
+        std::cout << "      - Pre-encrypt data before GPU batch processing" << std::endl;
+        std::cout << "      - Use GPU for compute-heavy operations in sequence" << std::endl;
+    }
+    if (singleBreakdown.gpuCompute > totalSingle * 0.3) {
+        std::cout << "    → GPU Compute is significant. Multi-GPU helps here!" << std::endl;
+        std::cout << "      - Achieved " << speedup << "x speedup with " << numGPUs << " GPUs" << std::endl;
+    }
     
     std::cout << "\n✓ Done!" << std::endl;
     return 0;
